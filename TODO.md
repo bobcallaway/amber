@@ -1,9 +1,9 @@
 - finish gRPC start & listener
 - trace/span
 - structured logging
+- add prometheus metrics
 - implement bolt DB lookup from hash -> index
-- support static timestamp per log for STH?
- - could modify config map[string]struct for this
+- use spanner emulator (docker: gcr.io/cloud-spanner-emulator/emulator)
 - return status.Error from all paths to be consistent with codes
 
 Test harness

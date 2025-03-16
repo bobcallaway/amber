@@ -16,16 +16,20 @@
 package app
 
 import (
+	"errors"
 	"flag"
 	"log"
+	"net"
 	"net/http"
 	"time"
 
 	"github.com/bobcallaway/amber/pkg/api"
+	"github.com/bobcallaway/amber/pkg/config"
 	"github.com/google/trillian"
 	"github.com/prometheus/client_golang/prometheus/promhttp"
 	"github.com/spf13/cobra"
 	"github.com/spf13/viper"
+	"google.golang.org/grpc"
 	"sigs.k8s.io/release-utils/version"
 )
 
@@ -45,12 +49,23 @@ var serveCmd = &cobra.Command{
 		}
 		log.Printf("starting amber-server @ %v", viStr)
 
-		facade, err := api.NewFacade(viper.GetStringMapString("logMap"))
+		config, err := config.NewConfig(viper.GetStringMap("logMap"))
+		if err != nil {
+			log.Fatalf("failed to read config: %v", err)
+		}
+
+		facade, err := api.NewFacade(config)
 		if err != nil {
 			log.Fatalf("failed to start amber-server: %v", err)
 		}
-		// TODO: finish registering this and launch GRPC listener
-		trillian.RegisterTrillianLogServer(nil, facade)
+
+		lis, err := net.Listen("tcp", viper.GetString("address")+":"+viper.GetString("port"))
+		if err != nil {
+			log.Fatalf("failed to listen: %v", err)
+		}
+
+		grpcServer := grpc.NewServer()
+		trillian.RegisterTrillianLogServer(grpcServer, facade)
 
 		http.Handle("/metrics", promhttp.Handler())
 		go func() {
@@ -59,8 +74,14 @@ var serveCmd = &cobra.Command{
 				ReadTimeout:  10 * time.Second,
 				WriteTimeout: 10 * time.Second,
 			}
-			_ = srv.ListenAndServe()
+			if err := srv.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
+				log.Printf("error listening on metrics endpoint: %v\n", err)
+			}
 		}()
+
+		if err := grpcServer.Serve(lis); err != nil {
+			log.Fatalf("failed to serve: %v", err)
+		}
 	},
 }
 

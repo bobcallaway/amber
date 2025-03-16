@@ -19,11 +19,11 @@ import (
 	"context"
 	"errors"
 	"math/big"
-	"strconv"
 	"strings"
 	"sync"
 	"time"
 
+	"github.com/bobcallaway/amber/pkg/config"
 	"github.com/google/trillian"
 	"github.com/google/trillian/types"
 	f_log "github.com/transparency-dev/formats/log"
@@ -47,7 +47,7 @@ func newLogMap() *logMap {
 	}
 }
 
-func (l *logMap) Add(logID int64, bucketName string) error {
+func (l *logMap) Add(logID, frozenTime int64, bucketName string) error {
 	fetcher, err := NewGCSFetcher(bucketName)
 	if err != nil {
 		return err
@@ -70,6 +70,7 @@ func (l *logMap) Add(logID int64, bucketName string) error {
 		f:     fetcher,
 		pb:    pb,
 		cp:    cp,
+		ts:    frozenTime,
 		logID: logID,
 	}
 
@@ -92,16 +93,12 @@ type Facade struct {
 	logMap *logMap
 }
 
-func NewFacade(config map[string]string) (*Facade, error) {
+func NewFacade(config *config.Config) (*Facade, error) {
 	facade := Facade{
 		logMap: newLogMap(),
 	}
-	for k, v := range config {
-		logID, err := strconv.Atoi(k)
-		if err != nil {
-			return nil, err
-		}
-		if err := facade.logMap.Add(int64(logID), v); err != nil {
+	for k, v := range config.LogConfigs {
+		if err := facade.logMap.Add(k, v.FrozenTime, v.BucketName); err != nil {
 			return nil, err
 		}
 	}
@@ -398,15 +395,15 @@ type trillianLogServer struct {
 	pb    *tessera.ProofBuilder
 	f     *GCSFetcher
 	cp    f_log.Checkpoint
-	//ts    uint64 //TODO: add fixed timestamp for STH response?
+	ts    int64
 }
 
 func (t *trillianLogServer) getSignedLogRoot() (*trillian.SignedLogRoot, error) {
-	// this converts the checkpoint data to a STH, with the current time representing timestamp_nanos
+	// this converts the checkpoint data to a STH, with the frozen time representing timestamp_nanos
 	lr, err := (&types.LogRootV1{
 		TreeSize:       t.cp.Size,
 		RootHash:       t.cp.Hash,
-		TimestampNanos: uint64(time.Now().UnixNano()),
+		TimestampNanos: uint64(t.ts),
 	}).MarshalBinary()
 	if err != nil {
 		return nil, err

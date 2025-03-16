@@ -1,5 +1,5 @@
 # amber
-Presents a "multi-tenant" Trillian gRPC facade for "frozen" transparency logs that are stored in the C2SP tiles-tlog format in Google Cloud Storage
+Presents a "multi-tenant" Trillian gRPC facade for "frozen" transparency logs that are stored in the C2SP tlog-tilse format in Google Cloud Storage
 
 ![Amber Logo](images/amber.png)
 

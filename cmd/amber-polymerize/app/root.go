@@ -42,8 +42,10 @@ func init() {
 	rootCmd.PersistentFlags().IP("trillian_log_server.address", net.ParseIP("127.0.0.1"), "Address to connect to")
 	rootCmd.PersistentFlags().Uint("trillian_log_server.port", 8080, "Port to connect to")
 	rootCmd.PersistentFlags().Int("trillian_log_server.log_id", -1, "ID of tree to read from")
+	rootCmd.PersistentFlags().String("origin", "", "origin string for log (to be used in C2SP-compliant checkpoint)")
 	rootCmd.PersistentFlags().Uint("start", 0, "First entry to copy")
 	rootCmd.PersistentFlags().Int("finish", -1, "Last entry to copy; -1 copies all entries from start to end of log")
+	rootCmd.PersistentFlags().String("bucket_name", "", "Name of GCS bucket to write to (will create if it doesn't exist)")
 
 	if err := viper.BindPFlags(rootCmd.PersistentFlags()); err != nil {
 		log.Fatal(err)
