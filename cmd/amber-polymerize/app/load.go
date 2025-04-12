@@ -17,7 +17,6 @@ package app
 
 import (
 	"context"
-	"crypto/rand"
 	"flag"
 	"fmt"
 	"log"
@@ -37,8 +36,8 @@ import (
 	f_log "github.com/transparency-dev/formats/log"
 	tessera "github.com/transparency-dev/trillian-tessera"
 	"github.com/transparency-dev/trillian-tessera/api/layout"
+	"github.com/transparency-dev/trillian-tessera/client"
 	tessera_gcp "github.com/transparency-dev/trillian-tessera/storage/gcp"
-	"golang.org/x/mod/sumdb/note"
 	"golang.org/x/oauth2/google"
 	"google.golang.org/api/googleapi"
 	"google.golang.org/api/option"
@@ -131,18 +130,11 @@ var loadCmd = &cobra.Command{
 			Bucket:  viper.GetString("bucket_name"),
 			Spanner: spanner,
 		})
-		skey, _, err := note.GenerateKey(rand.Reader, "ignored")
+		m, err := tessera.NewMigrationTarget(context.Background(), driver, tessera.NewMigrationOptions())
 		if err != nil {
 			log.Fatal(err)
 		}
-		signer, err := note.NewSigner(skey)
-		if err != nil {
-			log.Fatal(err)
-		}
-		logStorage, _, err := tessera.NewAppender(context.Background(), driver, tessera.WithBatching(1, 2*time.Second), tessera.WithCheckpointSigner(signer))
-		if err != nil {
-			log.Fatal(err)
-		}
+
 		// begin scrape of range
 		start := viper.GetInt64("start")
 		if start < 0 {
@@ -150,47 +142,16 @@ var loadCmd = &cobra.Command{
 		}
 		finish := viper.GetInt64("finish")
 		if finish == -1 {
-			finish = int64(logRoot.TreeSize) - 1
+			finish = int64(logRoot.TreeSize)
 		}
 		if start > finish {
 			log.Fatalf("start (%d) cannot be greater than finish (%d)", start, finish)
 		}
 
-		// batch reads as to minimize some network overhead
-		const batchSize int64 = 32
-
-		var actuallyFetched int64 = 0
-		for i := start; i <= finish; i = i + actuallyFetched {
-			numToFetch := batchSize
-			if i+numToFetch > finish {
-				numToFetch = finish - i + 1 // account for 0 offset
-			}
-			resp, err := tlc.GetLeavesByRange(context.Background(), &trillian.GetLeavesByRangeRequest{
-				LogId:      viper.GetInt64("trillian_log_server.log_id"),
-				StartIndex: i,
-				Count:      numToFetch,
-			})
-			if err != nil {
-				log.Fatal(err)
-			}
-			actuallyFetched = int64(len(resp.Leaves))
-			for _, leaf := range resp.Leaves {
-				tsMap[leaf.LeafIndex] = timestamps{
-					queued:     leaf.QueueTimestamp.GetNanos(),
-					integrated: leaf.IntegrateTimestamp.GetNanos(),
-				}
-				addFn := logStorage.Add(context.Background(), tessera.NewEntry(leaf.LeafValue))
-				index, err := addFn()
-				if err != nil {
-					log.Fatal(err)
-				}
-				if (start + int64(index)) != leaf.LeafIndex {
-					log.Fatalf("read from index %d, inserted at index %d", leaf.LeafIndex, index)
-				}
-				log.Printf("wrote %d to log\n", index)
-				time.Sleep(1800 * time.Millisecond)
-			}
-			//TODO: figure out how to write bundle metadata with timestamps
+		getBundle := bundleFetcher(tlc)
+		numWorkers := uint(10)
+		if err := m.Migrate(context.Background(), numWorkers, uint64(finish), logRoot.RootHash, getBundle); err != nil {
+			log.Fatalf("Migrate: %v", err)
 		}
 
 		// Write final checkpoint with frozen timestamp
@@ -211,6 +172,42 @@ var loadCmd = &cobra.Command{
 
 		time.Sleep(10 * time.Second)
 	},
+}
+
+func bundleFetcher(tlc trillian.TrillianLogClient) client.EntryBundleFetcherFunc {
+	batchSize := uint64(32)
+
+	return func(ctx context.Context, idx uint64, p uint8) ([]byte, error) {
+		remain := uint64(p)
+		if remain == 0 {
+			remain = layout.EntryBundleWidth
+		}
+		ret := make([]byte, 0, 64<<10)
+		startIdx := idx * layout.EntryBundleWidth
+		fetched := uint64(0)
+		for fetched < remain {
+			numToFetch := remain
+			if remain > batchSize {
+				numToFetch = batchSize
+			}
+			leafIdx := startIdx + uint64(fetched)
+			resp, err := tlc.GetLeavesByRange(context.Background(), &trillian.GetLeavesByRangeRequest{
+				LogId:      viper.GetInt64("trillian_log_server.log_id"),
+				StartIndex: int64(leafIdx),
+				Count:      int64(numToFetch),
+			})
+			if err != nil {
+				return nil, fmt.Errorf("trillian GetLeavesByRange(%d, %d): %v", leafIdx, numToFetch, err)
+			}
+			for _, l := range resp.Leaves {
+				bd := tessera.NewEntry(l.LeafValue).MarshalBundleData(leafIdx)
+				ret = append(ret, bd...)
+				fetched++
+			}
+			// Something something bundle metadata with timestamps
+		}
+		return ret, nil
+	}
 }
 
 func init() {
