@@ -23,8 +23,8 @@ import (
 	"net/http"
 	"time"
 
-	"github.com/bobcallaway/amber/pkg/api"
-	"github.com/bobcallaway/amber/pkg/config"
+	"github.com/bobcallaway/amber/internal/pkg/api"
+	"github.com/bobcallaway/amber/internal/pkg/config"
 	"github.com/google/trillian"
 	"github.com/prometheus/client_golang/prometheus/promhttp"
 	"github.com/spf13/cobra"

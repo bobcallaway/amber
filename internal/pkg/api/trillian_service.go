@@ -17,20 +17,18 @@ package api
 
 import (
 	"context"
-	"errors"
-	"math/big"
-	"strings"
 	"sync"
 	"time"
 
-	"github.com/bobcallaway/amber/pkg/config"
+	"github.com/bobcallaway/amber/internal/pkg/config"
+	tsmd "github.com/bobcallaway/amber/internal/pkg/metadata"
 	"github.com/google/trillian"
 	"github.com/google/trillian/types"
 	f_log "github.com/transparency-dev/formats/log"
 	"github.com/transparency-dev/merkle/rfc6962"
-	t_api "github.com/transparency-dev/trillian-tessera/api"
-	"github.com/transparency-dev/trillian-tessera/api/layout"
-	tessera "github.com/transparency-dev/trillian-tessera/client"
+	t_api "github.com/transparency-dev/tessera/api"
+	"github.com/transparency-dev/tessera/api/layout"
+	tessera "github.com/transparency-dev/tessera/client"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
 	"google.golang.org/protobuf/types/known/timestamppb"
@@ -62,7 +60,7 @@ func (l *logMap) Add(logID, frozenTime int64, bucketName string) error {
 		return err
 	}
 
-	pb, err := tessera.NewProofBuilder(context.Background(), cp, fetcher.ReadTile)
+	pb, err := tessera.NewProofBuilder(context.Background(), cp.Size, fetcher.ReadTile)
 	if err != nil {
 		return err
 	}
@@ -285,18 +283,9 @@ func (f *Facade) GetEntryAndProof(ctx context.Context, req *trillian.GetEntryAnd
 	entry := bundle.Entries[offset]
 
 	// extract timestamps for entry from object metadata
-	offsetB36 := big.NewInt(offset).Text(36)
-	queueTSB36, integrateOffsetTSB36, found := strings.Cut(metadata[offsetB36], "")
-	if !found {
-		return nil, errors.New("unable to parse timestamp metadata")
-	}
-	queueTS := new(big.Int)
-	if _, ok := queueTS.SetString(queueTSB36, 36); !ok {
-		return nil, errors.New("unable to parse queue timestamp")
-	}
-	integrateOffsetTS := new(big.Int)
-	if _, ok := integrateOffsetTS.SetString(integrateOffsetTSB36, 36); !ok {
-		return nil, errors.New("unable to parse integration timestamp offset")
+	queueTS, integrateTS, err := tsmd.ParseTimestampMetadata(metadata, offset)
+	if err != nil {
+		return nil, err
 	}
 
 	// get inclusion proof for entry
@@ -315,8 +304,8 @@ func (f *Facade) GetEntryAndProof(ctx context.Context, req *trillian.GetEntryAnd
 			LeafIndex:          req.LeafIndex,
 			LeafValue:          entry,
 			MerkleLeafHash:     rfc6962.DefaultHasher.HashLeaf(entry),
-			QueueTimestamp:     timestamppb.New(time.Unix(0, queueTS.Int64())),
-			IntegrateTimestamp: timestamppb.New(time.Unix(0, queueTS.Int64()+integrateOffsetTS.Int64())),
+			QueueTimestamp:     timestamppb.New(time.Unix(0, queueTS)),
+			IntegrateTimestamp: timestamppb.New(time.Unix(0, integrateTS)),
 		},
 		Proof: &trillian.Proof{
 			Hashes:    proof,
@@ -356,26 +345,17 @@ func (f *Facade) GetLeavesByRange(ctx context.Context, req *trillian.GetLeavesBy
 			return nil, err
 		}
 		for i := uint(0); i < iter.N; i++ {
-			offsetB36 := big.NewInt(int64(iter.First + i)).Text(36)
-			queueTSB36, integrateOffsetTSB36, found := strings.Cut(metadata[offsetB36], "")
-			if !found {
-				return nil, errors.New("unable to parse timestamp metadata")
-			}
-			queueTS := new(big.Int)
-			if _, ok := queueTS.SetString(queueTSB36, 36); !ok {
-				return nil, errors.New("unable to parse queue timestamp")
-			}
-			integrateOffsetTS := new(big.Int)
-			if _, ok := integrateOffsetTS.SetString(integrateOffsetTSB36, 36); !ok {
-				return nil, errors.New("unable to parse integration timestamp offset")
+			queueTS, integrateTS, err := tsmd.ParseTimestampMetadata(metadata, int64(iter.First+i))
+			if err != nil {
+				return nil, err
 			}
 
 			resp.Leaves = append(resp.Leaves, &trillian.LogLeaf{
 				LeafValue:          bundle.Entries[iter.First+i],
 				MerkleLeafHash:     rfc6962.DefaultHasher.HashLeaf(bundle.Entries[iter.First+i]),
 				LeafIndex:          int64(iter.First + i),
-				QueueTimestamp:     timestamppb.New(time.Unix(0, queueTS.Int64())),
-				IntegrateTimestamp: timestamppb.New(time.Unix(0, queueTS.Int64()+integrateOffsetTS.Int64())),
+				QueueTimestamp:     timestamppb.New(time.Unix(0, queueTS)),
+				IntegrateTimestamp: timestamppb.New(time.Unix(0, integrateTS)),
 			})
 		}
 	}

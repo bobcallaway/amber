@@ -24,7 +24,7 @@ import (
 	"sync"
 
 	"cloud.google.com/go/storage"
-	"github.com/transparency-dev/trillian-tessera/api/layout"
+	"github.com/transparency-dev/tessera/api/layout"
 	"google.golang.org/api/googleapi"
 )
 
@@ -66,7 +66,9 @@ func (g *GCSFetcher) FetchWithMetadata(ctx context.Context, path string) ([]byte
 		return nil, nil, err
 	}
 
-	defer reader.Close()
+	defer func() {
+		_ = reader.Close() // Best effort close, data already read
+	}()
 	bytes, err := io.ReadAll(reader)
 	if err != nil {
 		return nil, nil, err

@@ -21,23 +21,24 @@ import (
 	"fmt"
 	"log"
 	"os"
-	"time"
+	"strings"
 
 	spanner_database "cloud.google.com/go/spanner/admin/database/apiv1"
 	"cloud.google.com/go/spanner/admin/database/apiv1/databasepb"
 	spanner_instance "cloud.google.com/go/spanner/admin/instance/apiv1"
 	"cloud.google.com/go/spanner/admin/instance/apiv1/instancepb"
-	"cloud.google.com/go/storage"
+	"github.com/bobcallaway/amber/internal/pkg/gcs"
+	tsmd "github.com/bobcallaway/amber/internal/pkg/metadata"
 	"github.com/google/trillian"
 	"github.com/google/trillian/types"
 	"github.com/google/uuid"
 	"github.com/spf13/cobra"
 	"github.com/spf13/viper"
 	f_log "github.com/transparency-dev/formats/log"
-	tessera "github.com/transparency-dev/trillian-tessera"
-	"github.com/transparency-dev/trillian-tessera/api/layout"
-	"github.com/transparency-dev/trillian-tessera/client"
-	tessera_gcp "github.com/transparency-dev/trillian-tessera/storage/gcp"
+	"github.com/transparency-dev/tessera"
+	"github.com/transparency-dev/tessera/api/layout"
+	"github.com/transparency-dev/tessera/client"
+	tessera_gcp "github.com/transparency-dev/tessera/storage/gcp"
 	"golang.org/x/oauth2/google"
 	"google.golang.org/api/googleapi"
 	"google.golang.org/api/option"
@@ -46,12 +47,11 @@ import (
 	"sigs.k8s.io/release-utils/version"
 )
 
-type timestamps struct {
-	queued     int32
-	integrated int32
-}
+// bundleTimestamps stores timestamp pairs for all entries in a bundle
+type bundleTimestamps []tsmd.TimestampPair
 
-var tsMap map[int64]timestamps = make(map[int64]timestamps)
+// timestampStore maps bundle index -> timestamps for that bundle
+var timestampStore = make(map[uint64]bundleTimestamps)
 
 // loadCmd represents the load command
 var loadCmd = &cobra.Command{
@@ -98,18 +98,55 @@ var loadCmd = &cobra.Command{
 			log.Fatalf("asked for entries outside of known range (treeSize = %d, finish = %d)", logRoot.TreeSize, viper.GetUint64("finish"))
 		}
 
+		// Create metadata provider that looks up timestamps from timestampStore
+		metadataProvider := func(objectPath string) map[string]string {
+			// Only add metadata for entry bundle objects
+			// Entry paths look like: tile/entries/000 or tile/entries/x000/111
+			if !strings.HasPrefix(objectPath, "tile/entries/") {
+				return nil
+			}
+
+			// Parse the entry bundle index from the path using ParseTileIndexPartial
+			// Extract just the index portion after "tile/entries/"
+			indexPart := strings.TrimPrefix(objectPath, "tile/entries/")
+			bundleIndex, partial, err := layout.ParseTileIndexPartial(indexPart)
+			if err != nil {
+				log.Printf("Warning: failed to parse entry path %s: %v", objectPath, err)
+				return nil
+			}
+
+			// Look up timestamps for this bundle
+			timestamps, ok := timestampStore[bundleIndex]
+			if !ok || len(timestamps) == 0 {
+				log.Printf("Warning: no timestamps found for bundle %d (path: %s)", bundleIndex, objectPath)
+				return nil
+			}
+
+			// Verify the number of timestamps matches the expected bundle size
+			expectedCount := int(layout.EntryBundleWidth)
+			if partial > 0 {
+				expectedCount = int(partial)
+			}
+			if len(timestamps) != expectedCount {
+				log.Fatalf("Warning: timestamp count mismatch for bundle %d: got %d, expected %d (path: %s)",
+					bundleIndex, len(timestamps), expectedCount, objectPath)
+			}
+
+			return tsmd.BuildTimestampMetadata(timestamps)
+		}
+
+		// Initialize GCS client with dynamic metadata injection
+		gcsClientWithMetadata, err := gcs.NewClientWithMetadata(context.Background(), metadataProvider)
+		if err != nil {
+			log.Fatal(err)
+		}
+
 		creds, err := google.FindDefaultCredentials(context.Background())
 		if err != nil {
 			log.Fatalf("Failed to get default credentials: %v", err)
 		}
 
-		// initialize GCS bucket (creating if necessary)
-		gcsClient, err := storage.NewClient(context.Background())
-		if err != nil {
-			log.Fatal(err)
-		}
-
-		bucket := gcsClient.Bucket(viper.GetString("bucket_name"))
+		bucket := gcsClientWithMetadata.Bucket(viper.GetString("bucket_name"))
 		if _, err := bucket.Attrs(context.Background()); err != nil {
 			if e, ok := err.(*googleapi.Error); ok && e.Code == 404 {
 				// bucket doesn't exist, create it
@@ -127,9 +164,13 @@ var loadCmd = &cobra.Command{
 			log.Fatal(err)
 		}
 		driver, err := tessera_gcp.New(context.Background(), tessera_gcp.Config{
-			Bucket:  viper.GetString("bucket_name"),
-			Spanner: spanner,
+			Bucket:    viper.GetString("bucket_name"),
+			GCSClient: gcsClientWithMetadata,
+			Spanner:   spanner,
 		})
+		if err != nil {
+			log.Fatal(err)
+		}
 		m, err := tessera.NewMigrationTarget(context.Background(), driver, tessera.NewMigrationOptions())
 		if err != nil {
 			log.Fatal(err)
@@ -169,8 +210,6 @@ var loadCmd = &cobra.Command{
 		if err := cpHandle.Close(); err != nil {
 			log.Fatal(err)
 		}
-
-		time.Sleep(10 * time.Second)
 	},
 }
 
@@ -185,11 +224,12 @@ func bundleFetcher(tlc trillian.TrillianLogClient) client.EntryBundleFetcherFunc
 		ret := make([]byte, 0, 64<<10)
 		startIdx := idx * layout.EntryBundleWidth
 		fetched := uint64(0)
+
+		// Collect timestamps for this bundle
+		bundleTimestamps := make([]tsmd.TimestampPair, 0, remain)
+
 		for fetched < remain {
-			numToFetch := remain
-			if remain > batchSize {
-				numToFetch = batchSize
-			}
+			numToFetch := min(remain, batchSize)
 			leafIdx := startIdx + uint64(fetched)
 			resp, err := tlc.GetLeavesByRange(context.Background(), &trillian.GetLeavesByRangeRequest{
 				LogId:      viper.GetInt64("trillian_log_server.log_id"),
@@ -200,12 +240,22 @@ func bundleFetcher(tlc trillian.TrillianLogClient) client.EntryBundleFetcherFunc
 				return nil, fmt.Errorf("trillian GetLeavesByRange(%d, %d): %v", leafIdx, numToFetch, err)
 			}
 			for _, l := range resp.Leaves {
+				// Store timestamp for this entry
+				// Convert timestamppb.Timestamp to nanoseconds since epoch
+				bundleTimestamps = append(bundleTimestamps, tsmd.TimestampPair{
+					QueueTimestampNanos:     l.QueueTimestamp.AsTime().UnixNano(),
+					IntegrateTimestampNanos: l.IntegrateTimestamp.AsTime().UnixNano(),
+				})
+
 				bd := tessera.NewEntry(l.LeafValue).MarshalBundleData(leafIdx)
 				ret = append(ret, bd...)
 				fetched++
 			}
-			// Something something bundle metadata with timestamps
 		}
+
+		// Store timestamps for this bundle indexed by bundle index
+		timestampStore[idx] = bundleTimestamps
+
 		return ret, nil
 	}
 }
@@ -224,7 +274,11 @@ func createSpannerInstanceAndDB() (string, error) {
 	if err != nil {
 		return "", fmt.Errorf("create instance client %w", err)
 	}
-	defer instanceAdmin.Close()
+	defer func() {
+		if err := instanceAdmin.Close(); err != nil {
+			log.Printf("Warning: failed to close instance admin client: %v", err)
+		}
+	}()
 
 	uuid := uuid.NewString()
 	name := fmt.Sprintf("amber-%s", uuid)
@@ -251,7 +305,11 @@ func createSpannerInstanceAndDB() (string, error) {
 	if err != nil {
 		return "", fmt.Errorf("create database client %w", err)
 	}
-	defer adminClient.Close()
+	defer func() {
+		if err := adminClient.Close(); err != nil {
+			log.Printf("Warning: failed to close database admin client: %v", err)
+		}
+	}()
 
 	op2, err := adminClient.CreateDatabase(context.Background(), &databasepb.CreateDatabaseRequest{
 		Parent:          instance.Name,
