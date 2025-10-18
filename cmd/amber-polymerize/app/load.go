@@ -20,6 +20,7 @@ import (
 	"flag"
 	"fmt"
 	"log"
+	"math"
 	"os"
 	"strings"
 
@@ -28,6 +29,7 @@ import (
 	spanner_instance "cloud.google.com/go/spanner/admin/instance/apiv1"
 	"cloud.google.com/go/spanner/admin/instance/apiv1/instancepb"
 	"github.com/bobcallaway/amber/internal/pkg/gcs"
+	"github.com/bobcallaway/amber/internal/pkg/hashmap"
 	tsmd "github.com/bobcallaway/amber/internal/pkg/metadata"
 	"github.com/google/trillian"
 	"github.com/google/trillian/types"
@@ -189,10 +191,49 @@ var loadCmd = &cobra.Command{
 			log.Fatalf("start (%d) cannot be greater than finish (%d)", start, finish)
 		}
 
-		getBundle := bundleFetcher(tlc)
+		falsePositiveRate := viper.GetFloat64("hashmap.false_positive_rate")
+		if falsePositiveRate <= 0 || falsePositiveRate >= 1 {
+			log.Fatalf("hashmap.false_positive_rate must be between 0 and 1, got %f", falsePositiveRate)
+		}
+
+		hashMapDir := viper.GetString("hashmap.temp_dir")
+		cleanupTempDir := false
+		if hashMapDir == "" {
+			hashMapDir, err = os.MkdirTemp("", "amber-hashmap-")
+			if err != nil {
+				log.Fatalf("create temporary hash map directory: %v", err)
+			}
+			cleanupTempDir = true
+		} else {
+			if err := os.MkdirAll(hashMapDir, 0o755); err != nil {
+				log.Fatalf("ensure hash map directory %s exists: %v", hashMapDir, err)
+			}
+		}
+
+		prefixLength := hashmap.CalculateShardPrefixLength(logRoot.TreeSize)
+		indexBuilder, err := newHashIndexBuilder(hashMapDir, logRoot.TreeSize, prefixLength, falsePositiveRate)
+		if err != nil {
+			log.Fatalf("init hash index builder: %v", err)
+		}
+		log.Printf("hash index builder configured with prefix length %d and %.4f false-positive rate", prefixLength, falsePositiveRate)
+
+		getBundle := bundleFetcher(tlc, indexBuilder)
 		numWorkers := uint(10)
 		if err := m.Migrate(context.Background(), numWorkers, uint64(finish), logRoot.RootHash, getBundle); err != nil {
 			log.Fatalf("Migrate: %v", err)
+		}
+
+		var cleanupFn func(string) error
+		if cleanupTempDir {
+			cleanupFn = os.Remove
+		}
+		if err := indexBuilder.Finalize(context.Background(), bucket, cleanupFn); err != nil {
+			log.Fatalf("finalize hash index: %v", err)
+		}
+		if cleanupTempDir {
+			if err := os.RemoveAll(hashMapDir); err != nil {
+				log.Printf("Warning: failed to clean up hash map directory %s: %v", hashMapDir, err)
+			}
 		}
 
 		// Write final checkpoint with frozen timestamp
@@ -213,7 +254,7 @@ var loadCmd = &cobra.Command{
 	},
 }
 
-func bundleFetcher(tlc trillian.TrillianLogClient) client.EntryBundleFetcherFunc {
+func bundleFetcher(tlc trillian.TrillianLogClient, indexBuilder *hashIndexBuilder) client.EntryBundleFetcherFunc {
 	batchSize := uint64(32)
 
 	return func(ctx context.Context, idx uint64, p uint8) ([]byte, error) {
@@ -231,7 +272,7 @@ func bundleFetcher(tlc trillian.TrillianLogClient) client.EntryBundleFetcherFunc
 		for fetched < remain {
 			numToFetch := min(remain, batchSize)
 			leafIdx := startIdx + uint64(fetched)
-			resp, err := tlc.GetLeavesByRange(context.Background(), &trillian.GetLeavesByRangeRequest{
+			resp, err := tlc.GetLeavesByRange(ctx, &trillian.GetLeavesByRangeRequest{
 				LogId:      viper.GetInt64("trillian_log_server.log_id"),
 				StartIndex: int64(leafIdx),
 				Count:      int64(numToFetch),
@@ -240,6 +281,12 @@ func bundleFetcher(tlc trillian.TrillianLogClient) client.EntryBundleFetcherFunc
 				return nil, fmt.Errorf("trillian GetLeavesByRange(%d, %d): %v", leafIdx, numToFetch, err)
 			}
 			for _, l := range resp.Leaves {
+				currentIndexUint := startIdx + fetched
+				if currentIndexUint > math.MaxInt64 {
+					return nil, fmt.Errorf("log index %d exceeds int64 limits", currentIndexUint)
+				}
+				currentIndex := int64(currentIndexUint)
+
 				// Store timestamp for this entry
 				// Convert timestamppb.Timestamp to nanoseconds since epoch
 				bundleTimestamps = append(bundleTimestamps, tsmd.TimestampPair{
@@ -247,7 +294,16 @@ func bundleFetcher(tlc trillian.TrillianLogClient) client.EntryBundleFetcherFunc
 					IntegrateTimestampNanos: l.IntegrateTimestamp.AsTime().UnixNano(),
 				})
 
-				bd := tessera.NewEntry(l.LeafValue).MarshalBundleData(leafIdx)
+				if indexBuilder != nil {
+					if len(l.MerkleLeafHash) == 0 {
+						return nil, fmt.Errorf("missing MerkleLeafHash for leaf %d", currentIndex)
+					}
+					if err := indexBuilder.Record(l.MerkleLeafHash, currentIndex); err != nil {
+						return nil, fmt.Errorf("record hash index for leaf %d: %w", currentIndex, err)
+					}
+				}
+
+				bd := tessera.NewEntry(l.LeafValue).MarshalBundleData(uint64(currentIndex))
 				ret = append(ret, bd...)
 				fetched++
 			}
@@ -262,6 +318,16 @@ func bundleFetcher(tlc trillian.TrillianLogClient) client.EntryBundleFetcherFunc
 
 func init() {
 	rootCmd.AddCommand(loadCmd)
+
+	loadCmd.Flags().Float64("hashmap_false_positive_rate", 0.01, "Target false-positive rate for hash prefix Bloom filters")
+	if err := viper.BindPFlag("hashmap.false_positive_rate", loadCmd.Flags().Lookup("hashmap_false_positive_rate")); err != nil {
+		log.Fatal(err)
+	}
+
+	loadCmd.Flags().String("hashmap_temp_dir", "", "Directory for temporary hash map shards (default: generated in system temp)")
+	if err := viper.BindPFlag("hashmap.temp_dir", loadCmd.Flags().Lookup("hashmap_temp_dir")); err != nil {
+		log.Fatal(err)
+	}
 }
 
 func createSpannerInstanceAndDB() (string, error) {

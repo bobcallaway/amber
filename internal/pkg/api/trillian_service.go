@@ -16,11 +16,19 @@
 package api
 
 import (
+	"bytes"
 	"context"
+	"encoding/binary"
+	"encoding/hex"
+	"errors"
+	"fmt"
+	"os"
 	"sync"
 	"time"
 
+	"github.com/bits-and-blooms/bloom"
 	"github.com/bobcallaway/amber/internal/pkg/config"
+	"github.com/bobcallaway/amber/internal/pkg/hashmap"
 	tsmd "github.com/bobcallaway/amber/internal/pkg/metadata"
 	"github.com/google/trillian"
 	"github.com/google/trillian/types"
@@ -29,10 +37,17 @@ import (
 	t_api "github.com/transparency-dev/tessera/api"
 	"github.com/transparency-dev/tessera/api/layout"
 	tessera "github.com/transparency-dev/tessera/client"
+	bolt "go.etcd.io/bbolt"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
 	"google.golang.org/protobuf/types/known/timestamppb"
 )
+
+type hashShardAccessor interface {
+	HashPrefixExists(ctx context.Context, prefix string) (bool, error)
+	HashShardPaths(prefix string) (bloomPath, dbPath string)
+	ReadObject(ctx context.Context, path string) ([]byte, error)
+}
 
 type logMap struct {
 	mu   sync.RWMutex
@@ -51,6 +66,10 @@ func (l *logMap) Add(logID, frozenTime int64, bucketName string) error {
 		return err
 	}
 
+	if err := fetcher.ensureHashPrefixes(context.Background()); err != nil {
+		return err
+	}
+
 	cpRaw, err := fetcher.ReadCheckpoint(context.Background())
 	if err != nil {
 		return err
@@ -65,11 +84,13 @@ func (l *logMap) Add(logID, frozenTime int64, bucketName string) error {
 		return err
 	}
 	server := &trillianLogServer{
-		f:     fetcher,
-		pb:    pb,
-		cp:    cp,
-		ts:    frozenTime,
-		logID: logID,
+		f:          fetcher,
+		hashShards: fetcher,
+		pb:         pb,
+		cp:         cp,
+		ts:         frozenTime,
+		logID:      logID,
+		dbCache:    make(map[string]*bolt.DB),
 	}
 
 	l.mu.Lock()
@@ -161,12 +182,35 @@ func (f *Facade) GetInclusionProofByHash(ctx context.Context, req *trillian.GetI
 		return nil, status.Errorf(codes.InvalidArgument, "GetInclusionProofByHashRequest.LeafHash was %d bytes, wanted %d", got, want)
 	}
 
-	// TODO: Lookup index for leaf hash from bolt db file
-	var index int64
+	if req.TreeSize > int64(t.cp.Size) {
+		slr, err := t.getSignedLogRoot()
+		if err != nil {
+			return nil, err
+		}
+		return &trillian.GetInclusionProofByHashResponse{
+			SignedLogRoot: slr,
+		}, nil
+	}
+
+	index, err := t.lookupLeafIndexByHash(ctx, req.LeafHash)
+	if err != nil {
+		switch {
+		case errors.Is(err, errHashIndexNotFound):
+			return nil, status.Errorf(codes.NotFound, "leaf hash not found")
+		case errors.Is(err, errBloomFilterCorrupt), errors.Is(err, errHashDatabaseCorrupt):
+			return nil, status.Errorf(codes.Internal, "hash map shard corrupt: %v", err)
+		default:
+			return nil, status.Errorf(codes.Internal, "lookup hash index: %v", err)
+		}
+	}
+	if index >= req.TreeSize {
+		return nil, status.Errorf(codes.NotFound, "leaf hash not present at requested tree size")
+	}
 
 	wrappedResp, err := f.GetInclusionProof(ctx, &trillian.GetInclusionProofRequest{
 		LogId:     req.LogId,
 		LeafIndex: index,
+		TreeSize:  req.TreeSize,
 	})
 	if err != nil {
 		return nil, err
@@ -371,12 +415,21 @@ func (f *Facade) GetLeavesByRange(ctx context.Context, req *trillian.GetLeavesBy
 }
 
 type trillianLogServer struct {
-	logID int64
-	pb    *tessera.ProofBuilder
-	f     *GCSFetcher
-	cp    f_log.Checkpoint
-	ts    int64
+	logID      int64
+	pb         *tessera.ProofBuilder
+	f          *GCSFetcher
+	hashShards hashShardAccessor
+	cp         f_log.Checkpoint
+	ts         int64
+	dbCache    map[string]*bolt.DB
 }
+
+var (
+	errHashIndexNotFound   = errors.New("hash index not found")
+	errHashBucketMissing   = errors.New("hash index bucket missing")
+	errBloomFilterCorrupt  = errors.New("bloom filter corrupt")
+	errHashDatabaseCorrupt = errors.New("hash database corrupt")
+)
 
 func (t *trillianLogServer) getSignedLogRoot() (*trillian.SignedLogRoot, error) {
 	// this converts the checkpoint data to a STH, with the frozen time representing timestamp_nanos
@@ -391,6 +444,104 @@ func (t *trillianLogServer) getSignedLogRoot() (*trillian.SignedLogRoot, error) 
 	return &trillian.SignedLogRoot{
 		LogRoot: lr,
 	}, nil
+}
+
+func (t *trillianLogServer) lookupLeafIndexByHash(ctx context.Context, leafHash []byte) (int64, error) {
+	if len(leafHash) == 0 {
+		return 0, fmt.Errorf("leaf hash is empty")
+	}
+
+	hexDigest := hex.EncodeToString(leafHash)
+	prefixLen := hashmap.CalculateShardPrefixLength(t.cp.Size)
+	prefix := hexDigest[:prefixLen]
+	suffix := hexDigest[prefixLen:]
+	suffixKey := []byte(suffix)
+
+	exists, err := t.hashShards.HashPrefixExists(ctx, prefix)
+	if err != nil {
+		return 0, fmt.Errorf("check hash prefix %s: %w", prefix, err)
+	}
+	if !exists {
+		return 0, errHashIndexNotFound
+	}
+
+	bloomPath, dbPath := t.hashShards.HashShardPaths(prefix)
+
+	bloomBytes, err := t.hashShards.ReadObject(ctx, bloomPath)
+	if err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			return 0, errHashIndexNotFound
+		}
+		return 0, fmt.Errorf("read bloom filter %s: %w", bloomPath, err)
+	}
+
+	filter := &bloom.BloomFilter{}
+	if _, err := filter.ReadFrom(bytes.NewReader(bloomBytes)); err != nil {
+		return 0, fmt.Errorf("load bloom filter %s: %w", bloomPath, errors.Join(errBloomFilterCorrupt, err))
+	}
+
+	if !filter.Test(suffixKey) {
+		return 0, errHashIndexNotFound
+	}
+
+	dbBytes, err := t.hashShards.ReadObject(ctx, dbPath)
+	if err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			return 0, errHashIndexNotFound
+		}
+		return 0, fmt.Errorf("read hash db %s: %w", dbPath, err)
+	}
+
+	tmp, err := os.CreateTemp("", "amber-hashdb-*.db")
+	if err != nil {
+		return 0, fmt.Errorf("create temp db: %w", err)
+	}
+	tmpName := tmp.Name()
+	cleanup := func() {
+		_ = os.Remove(tmpName)
+	}
+	defer cleanup()
+
+	if _, err := tmp.Write(dbBytes); err != nil {
+		_ = tmp.Close()
+		return 0, fmt.Errorf("write temp db: %w", err)
+	}
+	if err := tmp.Close(); err != nil {
+		return 0, fmt.Errorf("close temp db: %w", err)
+	}
+
+	db, err := bolt.Open(tmpName, 0o600, &bolt.Options{ReadOnly: true})
+	if err != nil {
+		return 0, fmt.Errorf("open temp db: %w", err)
+	}
+	defer func() {
+		_ = db.Close()
+	}()
+
+	var index int64 = -1
+	if err := db.View(func(tx *bolt.Tx) error {
+		bucket := tx.Bucket(hashmap.HashIndexBucketKey)
+		if bucket == nil {
+			return errHashBucketMissing
+		}
+		value := bucket.Get(suffixKey)
+		if value == nil {
+			return nil
+		}
+		index = int64(binary.BigEndian.Uint64(value))
+		return nil
+	}); err != nil {
+		if errors.Is(err, errHashBucketMissing) {
+			return 0, fmt.Errorf("hash index bucket missing: %w", errHashDatabaseCorrupt)
+		}
+		return 0, fmt.Errorf("read temp db: %w", err)
+	}
+
+	if index < 0 {
+		return 0, errHashIndexNotFound
+	}
+
+	return index, nil
 }
 
 // Unimplemented gRPC service methods since this is for read-only usage

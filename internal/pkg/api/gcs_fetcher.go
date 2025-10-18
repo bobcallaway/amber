@@ -21,11 +21,13 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"strings"
 	"sync"
 
 	"cloud.google.com/go/storage"
 	"github.com/transparency-dev/tessera/api/layout"
 	"google.golang.org/api/googleapi"
+	"google.golang.org/api/iterator"
 )
 
 func NewGCSFetcher(bucketName string) (*GCSFetcher, error) {
@@ -54,6 +56,7 @@ type GCSFetcher struct {
 	client           *storage.Client
 	bucket           *storage.BucketHandle
 	cachedCheckpoint []byte
+	hashPrefixes     map[string]struct{}
 	mu               sync.RWMutex
 }
 
@@ -94,6 +97,64 @@ func (g *GCSFetcher) ReadCheckpoint(ctx context.Context) ([]byte, error) {
 	return cp, err
 }
 
+func (g *GCSFetcher) ensureHashPrefixes(ctx context.Context) error {
+	g.mu.RLock()
+	if g.hashPrefixes != nil {
+		g.mu.RUnlock()
+		return nil
+	}
+	g.mu.RUnlock()
+
+	query := &storage.Query{
+		Prefix: "hashmap/",
+	}
+
+	prefixes := make(map[string]struct{})
+	it := g.bucket.Objects(ctx, query)
+	for {
+		attrs, err := it.Next()
+		if err == iterator.Done {
+			break
+		}
+		if err != nil {
+			return fmt.Errorf("list hashmap objects: %w", err)
+		}
+		name := strings.TrimPrefix(attrs.Name, "hashmap/")
+		if name == "" {
+			continue
+		}
+		dot := strings.Index(name, ".")
+		if dot < 0 {
+			continue
+		}
+		prefix := name[:dot]
+		if prefix == "" {
+			continue
+		}
+		prefixes[prefix] = struct{}{}
+	}
+
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	g.hashPrefixes = prefixes
+	return nil
+}
+
+func (g *GCSFetcher) HashPrefixExists(ctx context.Context, prefix string) (bool, error) {
+	if err := g.ensureHashPrefixes(ctx); err != nil {
+		return false, err
+	}
+	g.mu.RLock()
+	defer g.mu.RUnlock()
+	_, ok := g.hashPrefixes[prefix]
+	return ok, nil
+}
+
+func (g *GCSFetcher) HashShardPaths(prefix string) (bloomPath, dbPath string) {
+	base := fmt.Sprintf("hashmap/%s", prefix)
+	return base + ".bloom", base + ".db"
+}
+
 func (g *GCSFetcher) ReadTile(ctx context.Context, l, i uint64, p uint8) ([]byte, error) {
 	bytes, _, err := g.FetchWithMetadata(ctx, layout.TilePath(l, i, p))
 	return bytes, err
@@ -110,4 +171,9 @@ func (g *GCSFetcher) ReadEntryBundle(ctx context.Context, i uint64, p uint8) ([]
 
 func (g *GCSFetcher) ReadEntryBundleWithMetadata(ctx context.Context, i uint64, p uint8) ([]byte, map[string]string, error) {
 	return g.FetchWithMetadata(ctx, layout.EntriesPath(i, p))
+}
+
+func (g *GCSFetcher) ReadObject(ctx context.Context, path string) ([]byte, error) {
+	bytes, _, err := g.FetchWithMetadata(ctx, path)
+	return bytes, err
 }

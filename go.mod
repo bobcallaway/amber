@@ -7,6 +7,7 @@ toolchain go1.24.1
 require (
 	cloud.google.com/go/spanner v1.85.1
 	cloud.google.com/go/storage v1.56.2
+	github.com/bits-and-blooms/bloom v2.0.3+incompatible
 	github.com/google/trillian v1.7.1
 	github.com/google/uuid v1.6.0
 	github.com/mitchellh/mapstructure v1.5.0
@@ -16,6 +17,7 @@ require (
 	github.com/transparency-dev/formats v0.0.0-20250421220931-bb8ad4d07c26
 	github.com/transparency-dev/merkle v0.0.2
 	github.com/transparency-dev/tessera v1.0.0
+	go.etcd.io/bbolt v1.4.3
 	golang.org/x/oauth2 v0.30.0
 	google.golang.org/api v0.249.0
 	google.golang.org/grpc v1.75.1
@@ -67,11 +69,13 @@ require (
 	github.com/sagikazarmark/locafero v0.4.0 // indirect
 	github.com/sagikazarmark/slog-shim v0.1.0 // indirect
 	github.com/sourcegraph/conc v0.3.0 // indirect
+	github.com/spaolacci/murmur3 v0.0.0-20180118202830-f09979ecbc72 // indirect
 	github.com/spf13/afero v1.11.0 // indirect
 	github.com/spf13/cast v1.7.0 // indirect
 	github.com/spf13/pflag v1.0.6 // indirect
 	github.com/spiffe/go-spiffe/v2 v2.5.0 // indirect
 	github.com/subosito/gotenv v1.6.0 // indirect
+	github.com/willf/bitset v1.1.11 // indirect
 	github.com/zeebo/errs v1.4.0 // indirect
 	go.opencensus.io v0.24.0 // indirect
 	go.opentelemetry.io/auto/sdk v1.1.0 // indirect

@@ -11,6 +11,8 @@ This repo contains two programs:
 ## amber-polymerize
 This program reads entries from a given Trillian log and writes entries into a C2SP tlog-tiles compliant format into a GCS bucket
 
+During migration, the tool also builds a sharded hash index to support `GetInclusionProofByHash`. Each shard comprises a BoltDB file containing suffix-to-index mappings plus a companion Bloom filter tuned via the `--hashmap_false_positive_rate` flag (default `0.01`). Temporary shard artifacts are written under the path provided by `--hashmap_temp_dir` (or a generated directory) before they are uploaded to the bucket paths shown below.
+
 ## amber-server
 This program acts a multi-tenant facade of a Trillian Log Server, implementing the read-only subset of the log_server_rpc interface (as defined at https://github.com/google/trillian/blob/master/trillian_log_api.proto)
  - the program is configured to have a map of tree/log IDs to GCS buckets
@@ -20,8 +22,14 @@ This program acts a multi-tenant facade of a Trillian Log Server, implementing t
 All paths are relative to the base of a GCS bucket:
 
 ```
-/leafhash-to-index-map.db
 /checkpoint
+/hashmap/000.db
+/hashmap/000.bloom
+/hashmap/001.db
+/hashmap/001.bloom
+...
+/hashmap/fff.db
+/hashmap/fff.bloom
 /tile/0/x001/x234/067
 /tile/0/x001/x234/067.p/8
 ...

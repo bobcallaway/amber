@@ -3,6 +3,7 @@
 - structured logging
 - add prometheus metrics
 - implement bolt DB lookup from hash -> index
+- ensure we have enough PV storage (500GB) for polymerize job
 - use spanner emulator (docker: gcr.io/cloud-spanner-emulator/emulator)
 - return status.Error from all paths to be consistent with codes
 
