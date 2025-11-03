@@ -4,32 +4,39 @@ Presents a "multi-tenant" Trillian gRPC facade for "frozen" transparency logs th
 ![Amber Logo](images/amber.png)
 
 # Overview
-This repo contains two programs:
+This repo contains three programs:
 - amber-polymerize
 - amber-server
+- amber-test
 
 ## amber-polymerize
-This program reads entries from a given Trillian log and writes entries into a C2SP tlog-tiles compliant format into a GCS bucket
+This program reads entries from a given Trillian log and writes entries into a C2SP tlog-tiles compliant format into a GCS bucket.
 
-During migration, the tool also builds a sharded hash index to support `GetInclusionProofByHash`. Each shard comprises a BoltDB file containing suffix-to-index mappings plus a companion Bloom filter tuned via the `--hashmap_false_positive_rate` flag (default `0.01`). Temporary shard artifacts are written under the path provided by `--hashmap_temp_dir` (or a generated directory) before they are uploaded to the bucket paths shown below.
+During migration, the tool also builds a sharded hash index to support `GetInclusionProofByHash`. Each shard now contains a serialized binary fuse filter, a minimal perfect hash function, and a densely packed array of global log indices. Shards are addressed by the first four hexadecimal characters of the leaf hash and are persisted as single `.shard` objects inside the `hashmap/` prefix. Temporary shard artifacts are written under the path provided by `--hashmap_temp_dir` (or a generated directory) before they are uploaded to the bucket paths shown below.
 
 ## amber-server
 This program acts a multi-tenant facade of a Trillian Log Server, implementing the read-only subset of the log_server_rpc interface (as defined at https://github.com/google/trillian/blob/master/trillian_log_api.proto)
  - the program is configured to have a map of tree/log IDs to GCS buckets
  - for each incoming gRPC request, the program acts as a Tessera client to read entries from the GCS bucket that stores the log contents
 
+## amber-test
+This program provides end-to-end testing for the migration workflow. It:
+1. Creates a new Trillian log and populates it with entries
+2. Runs amber-polymerize to migrate the log to GCS
+3. Starts amber-server to serve the migrated log
+4. Validates the migration by comparing GetLeavesByRange responses
+
+See [cmd/amber-test/README.md](cmd/amber-test/README.md) for detailed usage.
+
 ## per-log GCS Bucket Layout
 All paths are relative to the base of a GCS bucket:
 
 ```
 /checkpoint
-/hashmap/000.db
-/hashmap/000.bloom
-/hashmap/001.db
-/hashmap/001.bloom
+/hashmap/0000.shard
+/hashmap/0001.shard
 ...
-/hashmap/fff.db
-/hashmap/fff.bloom
+/hashmap/ffff.shard
 /tile/0/x001/x234/067
 /tile/0/x001/x234/067.p/8
 ...
@@ -82,12 +89,63 @@ This allows us to persist the queue and integration timestamps in a non-disrupti
 # Deployment pattern - TBD
 K8S Job amber-polymerize:
 - acts as a trillian client, reading all values from a frozen log and:
-    - copies values and metadata out into C2SP-compliant representation into a GCS bucket
-    - builds and persists a BoltDB file for map[leafhash]index to support Get____ByHash APIs (stored as object inside same bucket)
+  - copies values and metadata out into C2SP-compliant representation into a GCS bucket
+  - builds and persists shard artifacts (binary fuse + MPHF + index array) to support Get____ByHash APIs (stored as objects inside the same bucket)
 
 K8S Deployment amber-server
-- init container copies boltdb file from GCS into local volume for container; this optimizes reads from the local filesystem
+- lazily loads shard artifacts from GCS into an in-process LRU cache when lookups miss; no persistent local volume is required
 - exposes read-only Trillian log service over gRPC that actually extracts values from C2SP tiles stored in GCS
 
 K8S Service
 - exposes amber-server endpoint to rest of cluster
+
+# Testing
+
+## Running End-to-End Tests
+
+The `amber-test` tool provides comprehensive end-to-end testing of the migration workflow.
+
+### Prerequisites
+
+Start the test infrastructure with Docker Compose:
+
+```bash
+docker compose up -d
+```
+
+This starts:
+- MySQL database
+- Trillian log server
+- Trillian log signer
+- Fake GCS server
+- Spanner emulator
+
+### Run Tests
+
+Using the helper script:
+
+```bash
+export GOOGLE_CLOUD_PROJECT=your-project-id
+./scripts/run-test.sh
+```
+
+Or run directly:
+
+```bash
+go run ./cmd/amber-test test \
+  --project-id=your-project-id \
+  --num-entries=100
+```
+
+### What Gets Tested
+
+The test validates:
+- ✅ Log creation and entry queueing
+- ✅ Entry integration into Merkle tree
+- ✅ Migration from Trillian to Tessera tiles
+- ✅ Leaf value correctness
+- ✅ Merkle leaf hash computation
+- ✅ Timestamp preservation (queue and integrate times)
+- ✅ GetLeavesByRange API compatibility
+
+See [cmd/amber-test/README.md](cmd/amber-test/README.md) for detailed documentation.

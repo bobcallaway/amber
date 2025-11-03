@@ -1,0 +1,33 @@
+syntax = "proto3";
+
+package amber.hashmap;
+
+message Uint32List {
+  repeated uint32 values = 1;
+}
+
+message Uint64List {
+  repeated uint64 values = 1;
+}
+
+message ShardPayload {
+  uint32 version = 1;
+  uint32 prefix_length_hex = 2;
+  uint32 suffix_length_bytes = 3;
+  uint32 total_entries = 4;
+
+  uint64 filter_seed = 5;
+  uint32 filter_segment_length = 6;
+  uint32 filter_segment_length_mask = 7;
+  uint32 filter_segment_count = 8;
+  uint32 filter_segment_count_length = 9;
+  bytes filter_fingerprints = 10;
+
+  repeated int32 mph_values = 11;
+  repeated int32 mph_seeds = 12;
+
+  oneof indices {
+    Uint32List indices32 = 13;
+    Uint64List indices64 = 14;
+  }
+}

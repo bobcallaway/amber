@@ -1,0 +1,83 @@
+#
+# Copyright 2025 Google, LLC.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+services:
+  mysql:
+    platform: linux/amd64
+    image: gcr.io/trillian-opensource-ci/db_server:v1.4.0
+    environment:
+      - MYSQL_ROOT_PASSWORD=zaphod
+      - MYSQL_DATABASE=test
+      - MYSQL_USER=test
+      - MYSQL_PASSWORD=zaphod
+    restart: always # keep the MySQL server running
+    healthcheck:
+      # better healthcheck for MySQL. See https://github.com/docker-library/mysql/issues/930.
+      test: "mysqladmin -h 127.0.0.1 --user=$$MYSQL_USER --password=$$MYSQL_ROOT_PASSWORD -s ping"
+      interval: 5s
+      timeout: 3s
+      retries: 15
+      start_period: 90s
+  trillian-log-server:
+    image: ghcr.io/sigstore/scaffolding/trillian_log_server:v1.7.2@sha256:1cd5a597e4a716e71744055a646af02e38a2d8ba5221bf8e9056e457891af1df
+    command: [
+      "--quota_system=noop",
+      "--storage_system=mysql",
+      "--mysql_uri=test:zaphod@tcp(mysql:3306)/test",
+      "--rpc_endpoint=0.0.0.0:8090",
+      "--http_endpoint=0.0.0.0:8091",
+      "--alsologtostderr",
+    ]
+    restart: always # keep the Trillian log server up
+    ports:
+      - "8090:8090"
+      - "8091:8091"
+    depends_on:
+      mysql:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8091/healthz"]
+      interval: 5s
+      timeout: 3s
+      retries: 15
+      start_period: 15s
+  trillian-log-signer:
+    image: ghcr.io/sigstore/scaffolding/trillian_log_signer:v1.7.2@sha256:65ed1871a11d4bf2c1d0b7c1f8b5fbc90f842788edc577b90adb024dec03dbe2
+    command: [
+      "--quota_system=noop",
+      "--storage_system=mysql",
+      "--mysql_uri=test:zaphod@tcp(mysql:3306)/test",
+      "--rpc_endpoint=0.0.0.0:8090",
+      "--http_endpoint=0.0.0.0:8091",
+      "--force_master",
+      "--alsologtostderr",
+    ]
+    restart: always # keep the log signer up
+    ports:
+      - "8092:8091"
+    depends_on:
+      mysql:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8091/healthz"]
+      interval: 5s
+      timeout: 3s
+      retries: 15
+      start_period: 15s
+  spanner-emulator:
+    image: gcr.io/cloud-spanner-emulator/emulator
+    ports:
+      - "9010:9010"
+      - "9020:9020"

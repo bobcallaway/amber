@@ -13,15 +13,10 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-package hashmap
+package main
 
-const (
-	// ShardPrefixLengthHex defines how many hexadecimal characters from the
-	// leaf hash are used to select a shard. The current design always uses the
-	// first four hex characters (two bytes).
-	ShardPrefixLengthHex = 4
+import "github.com/bobcallaway/amber/cmd/amber-test/app"
 
-	// shardFormatVersion allows rolling upgrades of the shard serialization
-	// format. Increment when backwards incompatible changes are made.
-	shardFormatVersion = 1
-)
+func main() {
+	app.Execute()
+}

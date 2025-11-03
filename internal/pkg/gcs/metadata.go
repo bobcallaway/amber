@@ -23,6 +23,7 @@ import (
 	"mime"
 	"mime/multipart"
 	"net/http"
+	"os"
 	"strings"
 
 	"cloud.google.com/go/storage"
@@ -44,7 +45,7 @@ type metadataTransport struct {
 
 // RoundTrip implements http.RoundTripper interface.
 func (t *metadataTransport) RoundTrip(req *http.Request) (*http.Response, error) {
-	// Check if this is a GCS upload request
+	// Only handle uploads here; all other requests pass through unchanged
 	if !strings.Contains(req.URL.Path, "/upload/") {
 		return t.base.RoundTrip(req)
 	}
@@ -251,13 +252,27 @@ func cloneRequest(req *http.Request) *http.Request {
 //	}
 //	client, err := gcs.NewClientWithMetadata(ctx, provider)
 func NewClientWithMetadata(ctx context.Context, provider MetadataProvider, opts ...option.ClientOption) (*storage.Client, error) {
-	// Get default credentials
+	// If using emulator, skip authentication and use default emulator handling in client
+	if os.Getenv("STORAGE_EMULATOR_HOST") != "" {
+		customHTTPClient := &http.Client{
+			Transport: &metadataTransport{
+				base:     http.DefaultTransport,
+				provider: provider,
+			},
+		}
+		allOpts := append([]option.ClientOption{
+			option.WithHTTPClient(customHTTPClient),
+			option.WithoutAuthentication(),
+		}, opts...)
+		return storage.NewClient(ctx, allOpts...)
+	}
+
+	// Using production GCS with authentication
+	// Get default credentials for real GCS
 	creds, err := google.FindDefaultCredentials(ctx, storage.ScopeFullControl)
 	if err != nil {
 		return nil, err
-	}
-
-	// Create authenticated transport
+	} // Create authenticated transport
 	authTransport, err := htransport.NewTransport(ctx, http.DefaultTransport, option.WithCredentials(creds))
 	if err != nil {
 		return nil, err

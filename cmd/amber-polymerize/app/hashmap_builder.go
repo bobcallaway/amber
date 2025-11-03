@@ -1,55 +1,54 @@
 package app
 
 import (
+	"bufio"
 	"context"
+	"crypto/sha256"
 	"encoding/binary"
 	"encoding/hex"
 	"errors"
 	"fmt"
 	"io"
+	"log"
 	"math"
 	"os"
 	"path/filepath"
 	"sync"
+	"sync/atomic"
 
 	"cloud.google.com/go/storage"
-	"github.com/bits-and-blooms/bloom"
+	"github.com/FastFilter/xorfilter"
 	"github.com/bobcallaway/amber/internal/pkg/hashmap"
-	bolt "go.etcd.io/bbolt"
+	"github.com/cespare/xxhash/v2"
+	mph "github.com/dgryski/go-mph"
 )
 
-// hashIndexBuilder manages sharded hash-to-index mappings backed by BoltDB files
-// and companion Bloom filters. Each shard stores mappings for digests that share
-// the same hexadecimal prefix of length prefixLength.
-type hashIndexBuilder struct {
-	prefixLength      uint
-	shardDir          string
-	falsePositiveRate float64
-	expectedPerShard  uint
+const (
+	leafDigestLengthBytes = sha256.Size
+	shardPrefixByteLen    = hashmap.ShardPrefixLengthHex / 2
+	shardSuffixByteLen    = leafDigestLengthBytes - shardPrefixByteLen
+)
 
-	shards   map[string]*hashShard
-	shardsMu sync.Mutex
+type hashIndexBuilder struct {
+	shardDir string
+	treeSize uint64
+
+	shards sync.Map // map[string]*hashShard
 }
 
-// hashShard represents the on-disk state for a single prefix shard.
 type hashShard struct {
 	prefix    string
-	db        *bolt.DB
-	dbPath    string
-	bloom     *bloom.BloomFilter
-	bloomPath string
+	path      string
+	file      *os.File
+	writer    *bufio.Writer
+	count     int
+	suffixLen int
+	treeSize  uint64
 
 	mu sync.Mutex
 }
 
-// newHashIndexBuilder constructs a hashIndexBuilder.
-func newHashIndexBuilder(shardDir string, treeSize uint64, prefixLength uint, falsePositiveRate float64) (*hashIndexBuilder, error) {
-	if prefixLength == 0 || prefixLength > 64 {
-		return nil, fmt.Errorf("prefixLength must be in [1, 64], got %d", prefixLength)
-	}
-	if falsePositiveRate <= 0 || falsePositiveRate >= 1 {
-		return nil, fmt.Errorf("falsePositiveRate must be between 0 and 1 (exclusive), got %f", falsePositiveRate)
-	}
+func newHashIndexBuilder(shardDir string, treeSize uint64) (*hashIndexBuilder, error) {
 	if shardDir == "" {
 		return nil, errors.New("shardDir must be provided")
 	}
@@ -57,236 +56,291 @@ func newHashIndexBuilder(shardDir string, treeSize uint64, prefixLength uint, fa
 		return nil, fmt.Errorf("create shard directory: %w", err)
 	}
 
-	shardCount := uint64(1)
-	for i := uint(0); i < prefixLength; i++ {
-		shardCount *= 16
-	}
-	if shardCount == 0 {
-		return nil, fmt.Errorf("invalid shardCount for prefixLength %d", prefixLength)
+	if shardSuffixByteLen <= 0 {
+		return nil, fmt.Errorf("invalid suffix length computed: %d", shardSuffixByteLen)
 	}
 
-	expected := uint(1)
-	if treeSize > 0 {
-		perShard := math.Ceil(float64(treeSize) / float64(shardCount))
-		if perShard >= 1 {
-			expected = uint(perShard)
-		}
+	h := &hashIndexBuilder{
+		shardDir: shardDir,
+		treeSize: treeSize,
 	}
 
-	builder := &hashIndexBuilder{
-		prefixLength:      prefixLength,
-		shardDir:          shardDir,
-		falsePositiveRate: falsePositiveRate,
-		expectedPerShard:  expected,
-		shards:            make(map[string]*hashShard),
-	}
-
-	return builder, nil
+	return h, nil
 }
 
-// Record stores a mapping from the given digest to the provided log index.
-func (h *hashIndexBuilder) Record(digest []byte, logIndex int64) error {
-	if len(digest) == 0 {
-		return errors.New("digest must not be empty")
+func (h *hashIndexBuilder) Record(digest []byte, logIndex uint64) error {
+	if len(digest) != leafDigestLengthBytes {
+		return fmt.Errorf("digest length = %d, want %d", len(digest), leafDigestLengthBytes)
 	}
-	if logIndex < 0 {
-		return fmt.Errorf("logIndex must be non-negative, got %d", logIndex)
-	}
+	prefix := hex.EncodeToString(digest[:shardPrefixByteLen])
 
-	digestHex := hex.EncodeToString(digest)
-	if len(digestHex) < int(h.prefixLength) {
-		return fmt.Errorf("digest too short for prefix length %d", h.prefixLength)
-	}
-
-	prefix := digestHex[:int(h.prefixLength)]
-	suffix := digestHex[int(h.prefixLength):]
+	// Avoid allocation - use slice directly
+	suffix := digest[shardPrefixByteLen:]
 
 	shard, err := h.getOrCreateShard(prefix)
 	if err != nil {
 		return err
 	}
 
-	return shard.add([]byte(suffix), logIndex)
+	return shard.appendRecord(suffix, logIndex)
 }
 
-// Finalize persists Bloom filters, closes databases, uploads artifacts to GCS,
-// and optionally cleans up local files when cleanupFunc is provided.
 func (h *hashIndexBuilder) Finalize(ctx context.Context, bucket *storage.BucketHandle, cleanupFunc func(string) error) error {
-	if h == nil {
+	if bucket == nil {
+		return errors.New("bucket handle is nil")
+	}
+
+	// Collect all shards from sync.Map
+	var shards []*hashShard
+	h.shards.Range(func(key, value interface{}) bool {
+		shards = append(shards, value.(*hashShard))
+		return true
+	})
+
+	totalShards := len(shards)
+	if totalShards == 0 {
+		log.Printf("[HashIndex] No shards to finalize")
 		return nil
 	}
 
-	h.shardsMu.Lock()
-	shards := make([]*hashShard, 0, len(h.shards))
-	for _, shard := range h.shards {
-		shards = append(shards, shard)
+	// Close all writers first
+	for _, shard := range shards {
+		if err := shard.closeWriter(); err != nil {
+			return fmt.Errorf("close shard %s writer: %w", shard.prefix, err)
+		}
 	}
-	h.shardsMu.Unlock()
+
+	// Parallelize shard finalization with a worker pool
+	numWorkers := 4 // Process 4 shards concurrently
+	semaphore := make(chan struct{}, numWorkers)
+	errChan := make(chan error, len(shards))
+	var wg sync.WaitGroup
+	var processed int32
+
+	log.Printf("[HashIndex] Finalizing %d shards (workers=%d)...", totalShards, numWorkers)
 
 	for _, shard := range shards {
-		if err := shard.flush(); err != nil {
-			return fmt.Errorf("flush shard %s: %w", shard.prefix, err)
-		}
-		if err := shard.upload(ctx, bucket); err != nil {
-			return fmt.Errorf("upload shard %s: %w", shard.prefix, err)
-		}
-		if cleanupFunc != nil {
-			if err := cleanupFunc(shard.dbPath); err != nil && !errors.Is(err, os.ErrNotExist) {
-				return fmt.Errorf("cleanup db %s: %w", shard.dbPath, err)
+		wg.Add(1)
+		go func(s *hashShard) {
+			defer wg.Done()
+			semaphore <- struct{}{}        // Acquire
+			defer func() { <-semaphore }() // Release
+
+			log.Printf("[HashIndex] Building shard %s (entries=%d)...", s.prefix, s.count)
+			payload, err := s.buildPayload()
+			if err != nil {
+				errChan <- fmt.Errorf("build shard %s payload: %w", s.prefix, err)
+				return
 			}
-			if err := cleanupFunc(shard.bloomPath); err != nil && !errors.Is(err, os.ErrNotExist) {
-				return fmt.Errorf("cleanup bloom %s: %w", shard.bloomPath, err)
+
+			objectPath := filepath.ToSlash(filepath.Join("hashmap", s.prefix+".shard"))
+			writer := bucket.Object(objectPath).NewWriter(ctx)
+			writer.ContentType = "application/octet-stream"
+			if _, err := writer.Write(payload); err != nil {
+				_ = writer.Close()
+				errChan <- fmt.Errorf("write shard %s: %w", s.prefix, err)
+				return
 			}
-		}
+			if err := writer.Close(); err != nil {
+				errChan <- fmt.Errorf("close shard %s writer: %w", s.prefix, err)
+				return
+			}
+
+			if cleanupFunc != nil {
+				if err := cleanupFunc(s.path); err != nil && !errors.Is(err, os.ErrNotExist) {
+					errChan <- fmt.Errorf("cleanup shard %s: %w", s.prefix, err)
+					return
+				}
+			}
+
+			n := atomic.AddInt32(&processed, 1)
+			log.Printf("[HashIndex] Uploaded shard %s (%d/%d, %0.1f%%, bytes=%d)", s.prefix, n, totalShards, float64(n)*100.0/float64(totalShards), len(payload))
+		}(shard)
+	}
+
+	// Wait for all workers to complete
+	wg.Wait()
+	close(errChan)
+
+	// Check for any errors
+	for err := range errChan {
+		return err
 	}
 
 	return nil
 }
 
 func (h *hashIndexBuilder) getOrCreateShard(prefix string) (*hashShard, error) {
-	h.shardsMu.Lock()
-	shard, ok := h.shards[prefix]
-	h.shardsMu.Unlock()
-	if ok {
-		return shard, nil
+	// Fast path: shard already exists
+	if existing, ok := h.shards.Load(prefix); ok {
+		return existing.(*hashShard), nil
 	}
 
-	h.shardsMu.Lock()
-	defer h.shardsMu.Unlock()
-
-	if shard, ok := h.shards[prefix]; ok {
-		return shard, nil
-	}
-
-	newShard, err := h.newShard(prefix)
+	// Slow path: create new shard
+	newShard, err := newHashShard(h.shardDir, prefix, shardSuffixByteLen, h.treeSize)
 	if err != nil {
 		return nil, err
 	}
 
-	h.shards[prefix] = newShard
-	return newShard, nil
+	// Try to store, or use existing if another goroutine created it first
+	actual, loaded := h.shards.LoadOrStore(prefix, newShard)
+	if loaded {
+		// Another goroutine created it, close our duplicate
+		_ = newShard.closeWriter()
+	}
+	return actual.(*hashShard), nil
 }
 
-func (h *hashIndexBuilder) newShard(prefix string) (*hashShard, error) {
-	dbPath := filepath.Join(h.shardDir, fmt.Sprintf("%s.db", prefix))
-	bloomPath := filepath.Join(h.shardDir, fmt.Sprintf("%s.bloom", prefix))
-
-	db, err := bolt.Open(dbPath, 0o600, nil)
+func newHashShard(dir, prefix string, suffixLen int, treeSize uint64) (*hashShard, error) {
+	path := filepath.Join(dir, fmt.Sprintf("%s.records", prefix))
+	file, err := os.OpenFile(path, os.O_CREATE|os.O_TRUNC|os.O_WRONLY, 0o600)
 	if err != nil {
-		return nil, fmt.Errorf("open shard db: %w", err)
+		return nil, fmt.Errorf("open shard file: %w", err)
 	}
-
-	if err := db.Update(func(tx *bolt.Tx) error {
-		_, err := tx.CreateBucketIfNotExists(hashmap.HashIndexBucketKey)
-		return err
-	}); err != nil {
-		_ = db.Close()
-		return nil, fmt.Errorf("create bucket: %w", err)
-	}
-
-	expected := h.expectedPerShard
-	if expected < 1 {
-		expected = 1
-	}
-
-	bloomFilter := bloom.NewWithEstimates(expected, h.falsePositiveRate)
 
 	return &hashShard{
 		prefix:    prefix,
-		db:        db,
-		dbPath:    dbPath,
-		bloom:     bloomFilter,
-		bloomPath: bloomPath,
+		path:      path,
+		file:      file,
+		writer:    bufio.NewWriterSize(file, 8*1024), // 8KB buffer (reduced from 64KB to limit memory)
+		suffixLen: suffixLen,
+		treeSize:  treeSize,
 	}, nil
 }
 
-func (s *hashShard) add(key []byte, logIndex int64) error {
+func (s *hashShard) appendRecord(suffix []byte, index uint64) error {
+	if len(suffix) != s.suffixLen {
+		return fmt.Errorf("suffix length = %d, want %d", len(suffix), s.suffixLen)
+	}
+
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
+	if s.writer == nil {
+		return errors.New("shard writer is closed")
+	}
+
+	// Combine suffix and index into single write to reduce syscalls
 	var buf [8]byte
-	binary.BigEndian.PutUint64(buf[:], uint64(logIndex))
+	binary.BigEndian.PutUint64(buf[:], index)
 
-	if err := s.db.Update(func(tx *bolt.Tx) error {
-		b := tx.Bucket(hashmap.HashIndexBucketKey)
-		if b == nil {
-			return errors.New("hash index bucket missing")
-		}
-		return b.Put(key, buf[:])
-	}); err != nil {
-		return fmt.Errorf("put leaf index: %w", err)
+	if _, err := s.writer.Write(suffix); err != nil {
+		return fmt.Errorf("write suffix: %w", err)
+	}
+	if _, err := s.writer.Write(buf[:]); err != nil {
+		return fmt.Errorf("write index: %w", err)
 	}
 
-	s.bloom.Add(key)
-
+	s.count++
 	return nil
 }
 
-func (s *hashShard) flush() error {
+func (s *hashShard) closeWriter() error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	if s.db != nil {
-		if err := s.db.Sync(); err != nil {
-			_ = s.db.Close()
-			return fmt.Errorf("sync db: %w", err)
-		}
-		if err := s.db.Close(); err != nil {
-			return fmt.Errorf("close db: %w", err)
-		}
-		s.db = nil
+	if s.writer == nil {
+		return nil
 	}
 
-	f, err := os.Create(s.bloomPath)
-	if err != nil {
-		return fmt.Errorf("create bloom file: %w", err)
-	}
-	defer func() {
-		_ = f.Close()
-	}()
-
-	if _, err := s.bloom.WriteTo(f); err != nil {
-		return fmt.Errorf("write bloom filter: %w", err)
+	// Flush buffered data first
+	if err := s.writer.Flush(); err != nil {
+		_ = s.file.Close()
+		return fmt.Errorf("flush shard buffer: %w", err)
 	}
 
+	if err := s.file.Sync(); err != nil {
+		_ = s.file.Close()
+		return fmt.Errorf("sync shard file: %w", err)
+	}
+	if err := s.file.Close(); err != nil {
+		return fmt.Errorf("close shard file: %w", err)
+	}
+	s.writer = nil
+	s.file = nil
 	return nil
 }
 
-func (s *hashShard) upload(ctx context.Context, bucket *storage.BucketHandle) error {
-	if bucket == nil {
-		return errors.New("bucket handle is nil")
-	}
-
-	dbObject := bucket.Object(filepath.ToSlash(filepath.Join("hashmap", fmt.Sprintf("%s.db", s.prefix))))
-	if err := uploadFile(ctx, dbObject, s.dbPath); err != nil {
-		return fmt.Errorf("upload db: %w", err)
-	}
-
-	bloomObject := bucket.Object(filepath.ToSlash(filepath.Join("hashmap", fmt.Sprintf("%s.bloom", s.prefix))))
-	if err := uploadFile(ctx, bloomObject, s.bloomPath); err != nil {
-		return fmt.Errorf("upload bloom: %w", err)
-	}
-
-	return nil
-}
-
-func uploadFile(ctx context.Context, obj *storage.ObjectHandle, path string) error {
-	file, err := os.Open(path)
+func (s *hashShard) buildPayload() ([]byte, error) {
+	file, err := os.Open(s.path)
 	if err != nil {
-		return fmt.Errorf("open file %s: %w", path, err)
+		return nil, fmt.Errorf("open shard records: %w", err)
 	}
 	defer func() {
 		_ = file.Close()
 	}()
 
-	writer := obj.NewWriter(ctx)
-	if _, err := io.Copy(writer, file); err != nil {
-		_ = writer.Close()
-		return fmt.Errorf("write object: %w", err)
-	}
-	if err := writer.Close(); err != nil {
-		return fmt.Errorf("close writer: %w", err)
+	if s.count == 0 {
+		return nil, errors.New("shard contains no entries")
 	}
 
-	return nil
+	// Use buffered reader for better I/O performance
+	reader := bufio.NewReaderSize(file, 256*1024) // 256KB buffer
+
+	// Decide index width once based on overall tree size
+	use32 := s.treeSize > 0 && (s.treeSize-1) <= math.MaxUint32
+
+	suffixes := make([][]byte, s.count)
+	var indices32 []uint32
+	var indices64 []uint64
+	if use32 {
+		indices32 = make([]uint32, s.count)
+	} else {
+		indices64 = make([]uint64, s.count)
+	}
+
+	var indexBuf [8]byte
+	for i := 0; i < s.count; i++ {
+		suffix := make([]byte, s.suffixLen)
+		if _, err := io.ReadFull(reader, suffix); err != nil {
+			return nil, fmt.Errorf("read suffix %d: %w", i, err)
+		}
+		if _, err := io.ReadFull(reader, indexBuf[:]); err != nil {
+			return nil, fmt.Errorf("read index %d: %w", i, err)
+		}
+
+		suffixes[i] = suffix
+		idx := binary.BigEndian.Uint64(indexBuf[:])
+		if use32 {
+			indices32[i] = uint32(idx)
+		} else {
+			indices64[i] = idx
+		}
+	}
+
+	// Build hashes and keys in single pass
+	hashes := make([]uint64, s.count)
+	keys := make([]string, s.count)
+	for i := range suffixes {
+		hashes[i] = xxhash.Sum64(suffixes[i])
+		keys[i] = string(suffixes[i])
+	}
+
+	filter, err := xorfilter.PopulateBinaryFuse8(hashes)
+	if err != nil {
+		return nil, fmt.Errorf("build binary fuse filter: %w", err)
+	}
+
+	table := mph.New(keys)
+	if table == nil {
+		return nil, errors.New("mph construction failed")
+	}
+
+	shard := &hashmap.Shard{
+		Prefix: s.prefix,
+		Filter: filter,
+		Mph:    table,
+	}
+	if use32 {
+		shard.Indices32 = indices32
+	} else {
+		shard.Indices64 = indices64
+	}
+
+	payload, err := shard.Marshal()
+	if err != nil {
+		return nil, fmt.Errorf("marshal shard: %w", err)
+	}
+
+	return payload, nil
 }

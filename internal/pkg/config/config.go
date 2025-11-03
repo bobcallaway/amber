@@ -16,10 +16,9 @@
 package config
 
 import (
+	"encoding/json"
 	"log"
 	"strconv"
-
-	"github.com/mitchellh/mapstructure"
 )
 
 type Config struct {
@@ -27,26 +26,33 @@ type Config struct {
 }
 
 type logConfig struct {
-	FrozenTime int64
-	BucketName string
+	FrozenTime int64  `json:"frozenTime"`
+	BucketName string `json:"bucketName"`
 }
 
 func NewConfig(configMap map[string]any) (*Config, error) {
-	config := &Config{}
-	config.LogConfigs = make(map[int64]logConfig, len(configMap))
+	config := &Config{LogConfigs: make(map[int64]logConfig, len(configMap))}
 
 	for k, v := range configMap {
-		logID, err := strconv.Atoi(k)
+		logID, err := strconv.ParseInt(k, 10, 64)
 		if err != nil {
 			return nil, err
 		}
 
-		lc := logConfig{}
-		if err := mapstructure.Decode(v, &lc); err != nil {
+		// Marshal each value and unmarshal into logConfig
+		b, err := json.Marshal(v)
+		if err != nil {
 			return nil, err
 		}
-		config.LogConfigs[int64(logID)] = lc
+
+		var lc logConfig
+		if err := json.Unmarshal(b, &lc); err != nil {
+			return nil, err
+		}
+
+		config.LogConfigs[logID] = lc
 	}
-	log.Printf("config: %v\n", config)
+
+	log.Printf("config: %+v\n", config)
 	return config, nil
 }

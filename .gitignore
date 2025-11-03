@@ -2,3 +2,6 @@ amber-server
 !amber-server/
 amber-polymerize
 !amber-polymerize/
+amber-test
+!amber-test/
+testdata/

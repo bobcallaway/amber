@@ -20,6 +20,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log"
 	"os"
 	"strings"
 	"sync"
@@ -77,7 +78,32 @@ func (g *GCSFetcher) FetchWithMetadata(ctx context.Context, path string) ([]byte
 		return nil, nil, err
 	}
 
-	return bytes, reader.Metadata(), nil
+	// Normalize metadata keys to lowercase to account for header canonicalization
+	// (e.g., x-goog-meta-a may be reported as key "A" by the transport/XML path).
+	rawMD := reader.Metadata()
+	md := make(map[string]string, len(rawMD))
+	for k, v := range rawMD {
+		md[strings.ToLower(k)] = v
+	}
+	// Debug: log metadata keys for entry bundles to diagnose missing timestamps
+	if strings.HasPrefix(path, "tile/entries/") {
+		keys := make([]string, 0, len(md))
+		for k := range md {
+			keys = append(keys, k)
+		}
+		// avoid noisy logs; show up to 20 keys
+		max := len(keys)
+		if max > 20 {
+			max = 20
+		}
+		if len(keys) == 0 {
+			log.Printf("[GCSFetcher] Read %s: no metadata present", path)
+		} else {
+			log.Printf("[GCSFetcher] Read %s: metadata keys (showing %d/%d): %v", path, max, len(keys), keys[:max])
+		}
+	}
+
+	return bytes, md, nil
 }
 
 // since this should be constant, we read once from GCS and cache in memory for the life of the process
@@ -120,14 +146,10 @@ func (g *GCSFetcher) ensureHashPrefixes(ctx context.Context) error {
 			return fmt.Errorf("list hashmap objects: %w", err)
 		}
 		name := strings.TrimPrefix(attrs.Name, "hashmap/")
-		if name == "" {
+		if !strings.HasSuffix(name, ".shard") {
 			continue
 		}
-		dot := strings.Index(name, ".")
-		if dot < 0 {
-			continue
-		}
-		prefix := name[:dot]
+		prefix := strings.TrimSuffix(name, ".shard")
 		if prefix == "" {
 			continue
 		}
@@ -150,9 +172,14 @@ func (g *GCSFetcher) HashPrefixExists(ctx context.Context, prefix string) (bool,
 	return ok, nil
 }
 
-func (g *GCSFetcher) HashShardPaths(prefix string) (bloomPath, dbPath string) {
-	base := fmt.Sprintf("hashmap/%s", prefix)
-	return base + ".bloom", base + ".db"
+func (g *GCSFetcher) ReadShard(ctx context.Context, prefix string) ([]byte, error) {
+	path := g.shardObjectPath(prefix)
+	bytes, _, err := g.FetchWithMetadata(ctx, path)
+	return bytes, err
+}
+
+func (g *GCSFetcher) shardObjectPath(prefix string) string {
+	return fmt.Sprintf("hashmap/%s.shard", prefix)
 }
 
 func (g *GCSFetcher) ReadTile(ctx context.Context, l, i uint64, p uint8) ([]byte, error) {
